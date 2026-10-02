@@ -1,0 +1,452 @@
+This document contains testing guidelines, modification rules, and
+conventions for contributing to the system deployment scripts.
+
+--- Testing the Scripts ------------------------------------------------
+
+Three layers, cheapest first. The point of all three is that they
+assert; a harness that only shows you a console is a harness that
+cannot catch a system which installs cleanly, boots cleanly, reports
+no failed units, and is silently misconfigured anyway.
+
+1. tests/lint.sh - static checks. No root, no disk, no VM, and it
+   finishes in well under a second.
+
+     ./tests/lint.sh           warn if shellcheck is absent
+     ./tests/lint.sh --strict  fail if shellcheck is absent
+
+   It runs shellcheck over every *.sh in the repository, then checks
+   that every package name the scripts hand to pacman still exists,
+   by extracting them from the pacstrap and `pacman --sync` lines and
+   batching them through `pacman -Si`. Both profiles are covered in
+   one run, because the FOO_PKG variables are resolved against every
+   value they take, not just the current machine's.
+
+   Whole-line comments are dropped before that match. They were not
+   always, and a comment mentioning pacstrap or pacman parsed as an
+   invocation, every word after the command name being checked as a
+   package. A sentence explaining an install line is the likeliest
+   place for that, which is exactly where it was found.
+
+   Package names rot silently as upstream reorganises. This is the
+   only check that catches that, and it is by far the cheapest.
+   Run it before anything else. Note it is only as current as the
+   local sync database, and says so when that database is stale.
+
+   It then does the same for the two repositories post_install.sh
+   delegates to, if their working copies are present under tmp/ (see
+   layer 4 below). It checks that deploy.sh and the pkgbuilds
+   install.sh are where post_install.sh probes for them, that both
+   answer --list with something, and that every name in every
+   PKGBUILD's depends and makedepends still resolves. That last one
+   matters because makepkg pulls those at build time: a name that no
+   longer exists fails the build an hour into a VM run rather than
+   here, in a second.
+
+   Findings from shellcheck in those two scripts are reported but not
+   counted. They belong to repositories this one does not own, and a
+   warning there should not fail this one's lint -- but post_install.sh
+   executes them, so a break there still breaks a deployment.
+
+2. tests/assertions.sh - the post-conditions, and the load-bearing
+   piece. Sourceable, so the same claims can be checked against a
+   tree mounted by the VM harness, or against a running machine:
+
+     ./tests/assertions.sh /mnt amd     a freshly installed tree
+     sudo ./tests/assertions.sh / amd   this machine, right now
+
+   Five groups. `suite_baseline` is every promise install.sh already
+   makes (subvolumes, mount options, cmdline tokens, the UKI, hooks,
+   fstab, enabled units); these must pass, and a failure is a
+   regression. `suite_fresh` is the handoff to post_install.sh, valid
+   only on a just-installed tree. `suite_userland` is what the
+   dotfiles and PKGBUILD repositories left behind. `suite_live` is
+   what only a running kernel can answer. `suite_pending` is the
+   changes PLAN.amd and PLAN.intel describe but that have not landed;
+   those report as PEND, do not fail the run, and shrink to nothing as
+   the two plans are implemented.
+
+   `suite_baseline` asserts firmware per profile, and asserts one
+   package is absent as well as which are present. That asymmetry is
+   deliberate: linux-firmware depends on linux-firmware-intel, so a
+   positive check stays green even if the whole vendor metapackage
+   comes back. Only naming the package that must not be there catches
+   the regression this profile actually had.
+
+   `suite_userland` needs to know what was selected, since nothing on
+   the finished system records it. tests/vm.sh exports the selections
+   and this script reads the same two variables, so the run and the
+   checks cannot disagree. By hand, pass them as arguments:
+
+     sudo ./tests/assertions.sh / amd all st-git,dmenu-git
+
+   Given nothing, it reports SKIP: no selection was made, so nothing
+   was proven. What it checks when given something is derived from the
+   repository rather than listed here -- every regular file in a stow
+   package must be a symlink in the home directory pointing back at
+   it, so a dotfile added upstream is checked the day it lands. The
+   two temporary sudoers rules are checked unconditionally: both grant
+   the user passwordless access to a binary that is root by another
+   name, and the case where one survives is exactly the case where the
+   run failed partway.
+
+   Checks that need root to read (the ESP is dmask=0077, and listing
+   Btrfs subvolumes is privileged) report SKIP rather than a
+   misleading failure when run unprivileged.
+
+3. tests/vm.sh - a real UEFI boot, for the claims the first two
+   cannot reach: that the UKI actually boots, that sd-boot works,
+   that the LUKS volume unlocks, and that post_install.sh survives
+   contact with a running system.
+
+     ./tests/vm.sh --profile amd      both phases, headless, asserts
+     ./tests/vm.sh --profile intel    the laptop's disk layout
+     ./tests/vm.sh --phase install    phase one only
+     ./tests/vm.sh --phase post       phase two only, needs a kept disk
+     ./tests/vm.sh --interactive      a console, to poke by hand
+     ./tests/vm.sh --keep             keep the disk image and journals
+     ./tests/vm.sh --dotfiles LIST    what phase two stows
+     ./tests/vm.sh --pkgbuilds LIST   what phase two compiles
+     ./tests/vm.sh --userland DIR     where the two working copies are
+
+   The target disk is sized per profile: 20G for amd, 28G for intel,
+   which carves a 6 GiB hibernation swapfile out of it. qcow2 is
+   sparse, so the larger number costs nothing until it is used.
+
+   Journals are deleted at the start of every run and only then. That
+   matters because --forward-journal appends and --keep leaves the
+   work directory in place, so a run following a kept run used to
+   replay the previous guest's transcript ahead of its own, printing
+   two sets of assertions from two versions of the tree. The verdict
+   was never affected -- the result markers are read last-wins -- but
+   the log a human reads was, which is just as misleading. --keep
+   still preserves the disk image, NVRAM and TPM state afterwards.
+
+   LIST is comma-separated, or "all", or "none". The dotfiles default
+   to all, because stowing is seconds of work and the conflict
+   handling is the interesting part. The PKGBUILDs default to
+   dmenu-git,st-git rather than all, because all means compiling Emacs
+   and llama.cpp inside a VM; two suckless builds exercise the same
+   makepkg path -- the temporary sudoers rule, PKGDEST, the --syncdeps
+   dependency pull -- in minutes instead of hours.
+
+   Phase one boots the ISO, runs install.sh against a blank virtual
+   disk, asserts on the mounted tree, and checks that `umount -R /mnt`
+   actually succeeds. Phase two then boots THAT disk for real and runs
+   post_install.sh on it, followed by the full assertion set against a
+   live root. Phase two is the only thing that exercises the UKI,
+   sd-boot, the LUKS unlock, and every service post_install.sh enables.
+
+   The root filesystem is encrypted, so phase two would normally stop
+   at a passphrase prompt. It does not, because vmspawn passes the
+   `cryptsetup.passphrase` credential and systemd-cryptsetup in the
+   initrd reads it. Note this works for a volume named by
+   `rd.luks.name=` even though systemd-cryptsetup(8) documents the
+   credential against the gpt-auto-generated unit; it was verified
+   here rather than assumed.
+
+   Nothing here runs as root on the host. The installer runs inside
+   the guest, which is the whole point: install.sh calls
+   `cryptsetup open ... cryptroot`, `swapoff --all`, and reflector
+   with `--save /etc/pacman.d/mirrorlist`. On a host whose own root
+   is already /dev/mapper/cryptroot those are, in order, a name
+   collision, your swap, and your mirrorlist. A VM has none of those
+   problems, so install.sh runs there exactly as it does on real
+   hardware, with no test-only branches to weaken the result.
+
+   The disk type is chosen to match the profile, which is not
+   cosmetic: amd gets an NVMe (/dev/nvme0n1) and intel a SCSI disk
+   (/dev/sda), so the two runs exercise both branches of the
+   partition-suffix logic in install.sh.
+
+   systemd-vmspawn supplies as flags what the retired test_env.sh
+   assembled by hand: OVMF discovery and a private NVRAM copy, swtpm
+   started and torn down for us, the repository shared in over
+   virtiofs, and the guest journal forwarded to the host. It is a
+   front end to QEMU, not a replacement for it, so qemu-base and
+   swtpm must be installed; edk2-ovmf and virtiofsd arrive as
+   dependencies.
+
+   Automation needs no custom ISO. vmspawn passes two credentials
+   over SMBIOS, and the stock ISO's own systemd acts on them:
+   systemd.extra-unit.* adds a service that runs the installer and
+   then the assertions, and systemd.unit-dropin.multi-user.target
+   pulls that service into the boot. The ISO is cached under
+   tests/.cache and checksummed against upstream before it is booted.
+
+   The scripts no longer redirect their own output to /dev/ttyS0. That
+   block existed only because the retired test_env.sh pointed QEMU's
+   serial port at a file, and under vmspawn it does worse than
+   nothing: there is no serial sink, the write fails, and the
+   installer dies with "sed: couldn't flush stdout". Under this
+   harness the guest journal is the transcript. On real hardware,
+   ask for one at invocation time instead:
+
+     script -c './install.sh /dev/nvme0n1 amd' /tmp/install.log
+
+   ARCH_BOOTSTRAP_UNATTENDED=1 is what makes both scripts drivable,
+   and is never set on real hardware.
+
+     install.sh       needs ARCH_BOOTSTRAP_PASSPHRASE. Skips the
+                      destructive-format confirmation, reads the LUKS
+                      passphrase from the environment rather than the
+                      terminal, leaves root locked, and passes
+                      --variables=no to bootctl so a loop-mounted or
+                      virtual ESP cannot write the host's EFI
+                      variables.
+     post_install.sh  needs ARCH_BOOTSTRAP_PASSWORD. Skips the dotfile
+                      and PKGBUILD selection prompts, answering them
+                      from ARCH_BOOTSTRAP_DOTFILE_SELECTION and
+                      ARCH_BOOTSTRAP_PKGBUILD_SELECTION (empty, and it
+                      picks nothing), and sets a throwaway user
+                      password instead of asking. See the section on
+                      the userland working copies above.
+
+   Two host-side details worth knowing if you change the harness.
+   Results travel out of the guest in the forwarded journal, not over
+   SSH, so --pass-ssh-key=no is set deliberately: leaving it on makes
+   vmspawn generate a throwaway key every boot, and that is a step
+   that can fail for no benefit. And the repository reaches the guest
+   as a small ext4 image built with `mkfs.ext4 -d`, not as a virtiofs
+   --bind, because --bind needs virtiofsd to map a UID range into a
+   user namespace: unprivileged that requires systemd-nsresourced,
+   whose socket ships disabled, and vmspawn rejects --private-users=
+   for anything but --directory= boots.
+
+--- The Userland Working Copies (tmp/) ---------------------------------
+
+post_install.sh ends by handing the last two steps of a deployment to
+two other repositories: dotfiles, whose deploy.sh stows the config
+files, and pkgbuilds, whose install.sh compiles the custom packages.
+Left alone it clones both from GitHub over https.
+
+Clone them into tmp/ instead and the harness uses those working copies:
+
+  git clone <dotfiles>  tmp/dotfiles
+  git clone <pkgbuilds> tmp/pkgbuilds
+
+tests/vm.sh then stages them into the payload image, and post_install.sh
+copies from there rather than cloning. Three things follow. A test run
+exercises the trees on this machine, uncommitted work included, instead
+of whatever the remote is serving. A run no longer depends on the
+remote being reachable from inside the guest at exactly the wrong
+moment. And tests/lint.sh can check them, which is where the PKGBUILD
+dependency check above comes from.
+
+They are copied, not cloned, and the history is stripped on the way in.
+git refuses to clone from a repository whose ownership it does not
+recognise, and the staged tree belongs to whoever built the image; a
+copy sidesteps that without teaching post_install.sh a test-only
+exception. tmp/ is gitignored.
+
+Without the working copies everything still runs -- the guest clones,
+as it does on real hardware, and lint.sh says it is skipping that
+section. It is simply a less faithful run.
+
+Four environment variables drive this, all of them unset on real
+hardware, where the prompts are the entire point of running the script
+by hand:
+
+  ARCH_BOOTSTRAP_DOTFILES_SRC        clone from here instead of the
+  ARCH_BOOTSTRAP_PKGBUILDS_SRC       remote; a local path is copied
+  ARCH_BOOTSTRAP_DOTFILE_SELECTION   what unattended mode picks,
+  ARCH_BOOTSTRAP_PKGBUILD_SELECTION  instead of picking nothing
+
+The selections are passed through unvalidated on purpose. deploy.sh
+and the pkgbuilds install.sh already parse a selection and warn about
+names they do not recognise; checking it again in post_install.sh
+would test that copy of the logic rather than the one that runs.
+
+Until this existed, unattended mode selected nothing, which meant the
+two most failure-prone steps in post_install.sh -- stow's conflict
+handling and a real makepkg build -- were the only ones no test ever
+ran. They are also the two most likely to break, because they depend
+on repositories that change independently of this one.
+
+--- Modifying the Deployment Scripts -----------------------------------
+
+install.sh (Base System)
+  The script dynamically handles different disk nomenclatures
+  (NVMe vs SATA). Changes to the `sfdisk` layout require updating
+  the PART_EFI and PART_ROOT variables.
+
+  Partitioning strictly assumes a UEFI + LUKS2 + Btrfs topology.
+
+  The script now requires a mandatory hardware profile argument 
+  (`amd` or `intel`). Microcode, KMS modules (amdgpu/i915), and 
+  CPU scaling parameters are injected dynamically into the chroot.
+
+  Everything that differs between the two machines is set in the
+  single `case` block near the top, and nowhere else. Adding a
+  per-profile knob means adding a variable there, not adding an `if`
+  further down. The block currently carries UCODE_PKG, FW_PKG,
+  NET_PKG, KMS_MODULE, PSTATE_FLAG, MOUNT_OPTS, EXTRA_CMDLINE and
+  SWAPFILE_SIZE.
+
+  MOUNT_OPTS is per profile because the desktop is an NVMe SSD and
+  the laptop is a 5400 RPM disk; see README for the reasoning. Note
+  that Btrfs applies mount options per FILESYSTEM, not per subvolume,
+  so every subvolume mount inherits the same compression and commit
+  settings. A per-subvolume option is silently ignored, which is why
+  the swapfile's NOCOW guarantee comes from the file attribute that
+  `btrfs filesystem mkswapfile` sets, not from a nodatacow mount.
+
+  SWAPFILE_SIZE empty means no @swap subvolume and no swapfile at
+  all; that is how the desktop opts out of hibernation. When it is
+  set, the swapfile must be activated with swapon before genfstab
+  runs, because genfstab reads /proc/swaps and would otherwise emit
+  an fstab with no swap line.
+
+  EXTRA_CMDLINE is appended to the kernel command line after the
+  shared tokens. zswap.enabled=0 is deliberately NOT in it: it is
+  shared by both profiles and lives in the base string.
+
+  Chroot operations are isolated via heredoc (`<<'CHROOT'`).
+  Required environment variables are explicitly injected into the
+  `env` command to prevent premature expansion by the host shell.
+
+  The kernel is packaged as a secure Unified Kernel Image (UKI) via
+  mkinitcpio and systemd-ukify, not as separate vmlinuz/initramfs
+  files.
+
+post_install.sh (Post-installation)
+  The script reads the `/root/.deploy_profile` state file generated
+  in Phase 1 to apply the correct graphics packages (Vulkan/VA-API),
+  restrict makepkg compilation threads on low-RAM systems, and select
+  the CPU scaling policy.
+
+  As in install.sh, per-profile values belong in the `case` block at
+  the top: GPU_PKGS, VAAPI_ENV, MAKE_THREADS, CPU_GOVERNOR, CPU_EPP,
+  ZRAM_SIZE, ZRAM_RESIDENT, PROFILE_PKGS, XKB_LAYOUT, XKB_VARIANT.
+
+  CPU scaling is written to /etc/default/cpupower-service.conf with
+  an UPPERCASE GOVERNOR. This is not interchangeable with
+  /etc/default/cpupower: cpupower.service reads only the former, via
+  `EnvironmentFile=-`, and /usr/lib/systemd/scripts/cpupower reads
+  only $GOVERNOR. Writing the wrong file or the wrong case is a
+  silent no-op that still leaves the unit enabled and exiting 0, so
+  `systemctl --failed` will never reveal it. Verify by reading
+  /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor directly.
+
+  On `intel` the governor must be `powersave`, not `schedutil`.
+  Tiger Lake has HWP, so intel_pstate runs in active mode, where the
+  only accepted governors are powersave and performance. Bias is
+  steered by CPU_EPP, which the same file carries.
+
+  The laptop-only power management block is a single `if` near the
+  end of the tuning section, writing explicit config files rather
+  than adopting TLP, so every setting stays reviewable in this
+  repository. The battery charge cap is feature-detected, because the
+  in-kernel samsung-galaxybook driver probes per model.
+
+  Interactive prompts (e.g., dotfile selection) are handled via
+  local Bash namerefs (`local -n`), and read (I/O) is forced
+  directly from `/dev/tty`, so a prompt is never lost when the
+  script's own output is being piped or captured.
+
+  Secure Boot integration (sbctl) attempts to automatically create
+  and sign keys ONLY if the UEFI firmware reports being in
+  "Setup Mode". It signs both UKIs, systemd-bootx64.efi, and
+  /boot/EFI/BOOT/BOOTX64.EFI. That last one is the removable-media
+  fallback the firmware uses when no NVRAM entry resolves, after an
+  NVRAM reset or a CMOS clear; unsigned, it fails on a boot where
+  nothing was changed, which is a miserable thing to debug.
+
+  When the firmware is not in Setup Mode the block skips, and the
+  summary at the end of the run says so in full rather than printing
+  the success text. It used to print "keys are already signed/enrolled"
+  unconditionally, which is worse than silence: acting on it means
+  enabling Secure Boot against an unsigned UKI, and the firmware then
+  refuses to boot with no useful diagnostic.
+
+  Enrolling on locked-down OEM firmware
+  -------------------------------------
+  Verified on a Samsung laptop, AMI firmware 5.19, 2026-08-29. The
+  defaults there make every step of this invisible.
+
+  1. Key management is HIDDEN until a BIOS supervisor password is set.
+     Without one there is only "Secure Boot Control: On/Off", and no
+     way to reach Setup Mode at all. Set the password first; the
+     Secure Boot Configuration menu then appears.
+
+  2. Set "Secure Boot Mode" to Custom and leave it there. Standard
+     restores the factory keys and discards yours.
+
+  3. Set "Factory Default Key Provisioning" to Disabled BEFORE
+     deleting anything. While it is enabled the firmware re-provisions
+     factory keys as soon as it finds itself in Setup Mode, so the PK
+     deletion appears to succeed and is silently undone on reboot.
+
+  4. Delete the PK only, via PK Management. Do NOT use "Delete All
+     Secure Boot Variables": that also erases dbx, and sbctl cannot
+     put it back -- `enroll-keys --partial` covers PK, KEK and db and
+     has no dbx handling. Since enroll-keys --microsoft then trusts
+     Microsoft's certificates, wiping dbx leaves the machine unable to
+     reject anything Microsoft has revoked. Setup Mode only requires
+     that no PK is enrolled, so deleting the PK alone is sufficient
+     and keeps the revocation list intact.
+
+  5. `sbctl enroll-keys` will fail on immutable efivarfs entries.
+     Clear the flag narrowly, never across the whole directory:
+
+       sudo chattr -i /sys/firmware/efi/efivars/{KEK,db}-*
+
+     The kernel reapplies it on the next boot; nothing to undo. Note
+     db-* does not match dbx-*, so the revocation list stays locked.
+
+  6. This firmware accepts db and KEK from the OS but REFUSES the PK.
+     Enrolling anything else leaves Setup Mode still enabled, which is
+     the symptom: sbctl reports success, `sbctl status` disagrees. The
+     PK has to be enrolled from the firmware's own menu:
+
+       cd /boot && sudo sbctl enroll-keys --microsoft --export auth
+
+     /boot is the ESP, so it is FAT and the BIOS file browser can read
+     it. Then PK Management -> Set New Key -> "authenticated variable"
+     -> PK.auth. If the picker only offers "public key certificate",
+     convert the key instead:
+
+       sudo openssl x509 -in /var/lib/sbctl/keys/PK/PK.pem \
+                         -outform DER -out /boot/PK.der
+
+     Setup Mode reads Disabled once the PK takes. Remove the exported
+     files from the ESP afterwards.
+
+  7. Only then enable Secure Boot. tpm2-enroll.service fires on that
+     boot and asks for the passphrase and a new PIN.
+
+  8. If the supervisor password is now demanded at every boot, look
+     for a separate "Password on boot" toggle and disable that. Do not
+     clear the supervisor password itself: on this firmware it is what
+     exposes the Secure Boot menu, and clearing it can revert Secure
+     Boot Mode to Standard, which discards the keys and breaks the PIN
+     along with them, since PCR 7 measures Secure Boot state.
+
+  TPM 2.0 auto-unlock is NOT enrolled inline. Sealing a LUKS key to
+  PCR 7 is only valid while Secure Boot is actively enforcing, which
+  does not happen until after a reboot (and often a manual UEFI
+  toggle). The script therefore installs `/usr/local/sbin/tpm2-enroll.sh`
+  plus a `tpm2-enroll.service` one-shot unit gated by the marker
+  `/var/lib/tpm2-enroll.pending`. The unit is ordered Before getty@tty1
+  so the passphrase and PIN prompts own the console; once it exits,
+  getty starts and offers a login. (Conflicts=getty@tty1 must not be
+  used here: it cancels getty's start job for the whole boot, leaving
+  tty1 without a login prompt after enrollment finishes.)
+  It waits for `bootctl status` to report Secure Boot enabled,
+  enrolls PCR 7 with `--tpm2-with-pin=yes --wipe-slot=tpm2` (idempotent
+  and self-healing), removes the marker, and disables itself. If Secure
+  Boot is still off it exits cleanly and retries on the next boot.
+
+  Package compilation (makepkg) does not allow root execution.
+  The script bypasses this by creating temporary atomic rules in
+  sudoers (`zz-makepkg-pacman`), granting passwordless permission
+  to pacman during compilation, and revoking access via `trap` at
+  the end of execution.
+
+  Dotfiles are not installed directly here; responsibility is
+  delegated to the `deploy.sh` script (GNU Stow) under the context
+  of the unprivileged user.
+
+--- License ------------------------------------------------------------
+
+Copyright (C) 2026 Thiago C. Silva. Distributed under the GPLv3
+license or later. See the LICENSE file for details.

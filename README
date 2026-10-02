@@ -1,0 +1,158 @@
+This repository contains scripts to automate a minimalist Arch Linux
+deployment using strict hardware profiles (AMD Ryzen Desktop and Intel
+Celeron Laptop). The architecture is based on a pure X11 environment
+and the suckless toolset.
+
+--- System Architecture and Justifications -----------------------------
+
+Booting utilizes systemd-boot for native UEFI integration. Unified
+Kernel Images (UKIs) are built to package the kernel, initramfs,
+microcode, and arguments into a single executable. This simplifies
+Secure Boot via sbctl and prevents tampering. The EFI partition (ESP)
+is allocated 1GiB to accommodate multiple UKIs.
+
+The root system is encrypted with LUKS2 and bound to the TPM 2.0 (PCR
+7, the Secure Boot state) with a mandatory PIN for secure automatic
+decryption. PCR 7 is chosen deliberately: unlike PCR 0/4 it survives
+firmware and kernel updates, so auto-unlock keeps working after
+upgrades. Because sealing to PCR 7 is only valid once Secure Boot is
+actively enforcing, enrollment is deferred to a one-shot service that
+fires on the first boot with Secure Boot enabled. Internally, it is
+formatted as Btrfs with isolated subvolumes (@, @home, @cache, @log)
+to ensure that snapshot rollbacks do not destroy the pacman cache or
+log history. The snap-pac package automates protective snapshots
+during pacman transactions.
+
+The Btrfs mount options are per profile, because the two machines are
+opposites on the axis that matters. The desktop's NVMe gets ssd
+allocation heuristics and async discard. The laptop's 5400 RPM SATA
+disk gets neither: forcing ssd would defeat Btrfs's own rotational
+detection, and a hard disk has no TRIM to issue. It gets autodefrag
+instead, which targets the small-random-write fragmentation that
+copy-on-write produces on rotational media, a cheaper zstd:1 to spare
+a 1.8 GHz part with no turbo, and commit=120 so the disk wakes less
+often.
+
+The laptop additionally carries a @swap subvolume holding a 6 GiB
+swapfile, created with `btrfs filesystem mkswapfile` so the NOCOW
+attribute and preallocation are handled correctly. This exists for
+hibernation: systemd refuses to hibernate to zram, so a machine that
+is opened and closed all day needs real disk swap to suspend into.
+zram keeps the higher swap priority, so it still absorbs ordinary
+paging and systemd ignores it when choosing a hibernation target.
+
+System performance is optimized via zram-generator, with the VM
+subsystem tuned for the compressed device (high swappiness, no swap
+readahead). The desktop provisions half of system memory. The laptop
+provisions 1.5x instead, but pairs it with zram-resident-limit so the
+device may only ever consume about half the machine's physical RAM:
+generous virtual capacity, hard ceiling on real footprint, which is
+what 4 GB wants. zswap is disabled on the kernel command line for
+both, because Arch enables it by default and, left on, it intercepts
+pages before zram ever sees them.
+
+Firmware is per profile, and named per device rather than taken in
+bulk. linux-firmware is a metapackage that owns no files and pulls ten
+vendor subpackages, around 407 MiB, most of it for hardware neither of
+these machines has. The desktop installs the amdgpu subset; the laptop
+installs the intel one, which carries the i915 GuC/HuC/DMC blobs, the
+iwlwifi firmware for its AX201 and the Intel Bluetooth firmware. Both
+also install the realtek subset, for unrelated reasons: the desktop
+needs it for its analog audio output, the laptop for the onboard
+RTL8111/8168, where r8169 loads rtl_nic/rtl8168h-2.fw. Neither
+installs sof-firmware, because snd_intel_dspcfg selects the legacy HDA
+path on the laptop and Sound Open Firmware would sit unused. Should
+the internal microphone ever fail to capture, that package is the
+first thing to try: DMIC sometimes needs SOF when playback does not.
+
+CPU scaling is per profile. The desktop runs the performance governor
+to minimize state-transition latency. The laptop runs powersave with
+an EPP hint of balance_power: under HWP that is the dynamic governor,
+and the real bias knob in intel_pstate's active mode is the energy
+performance preference, not the governor name. Both are written to
+/etc/default/cpupower-service.conf, which is the file cpupower.service
+actually reads.
+
+An I/O scheduler policy is installed on both machines, attribute
+matched rather than device named: BFQ for rotational disks, none for
+NVMe. It is a no-op on the desktop and the largest single
+responsiveness win available on the laptop.
+
+The laptop carries a small set of explicit power-management files
+rather than TLP, so every setting stays visible in this repository:
+wifi and audio runtime power saving, PCI runtime power management, a
+relaxed dirty writeback interval to match commit=120, lid handling via
+suspend-then-hibernate, earlyoom configured never to kill the window
+manager or terminal, AC-gated Btrfs maintenance, and a battery charge
+cap applied only if the model actually exposes the attribute.
+
+Sleep is driven by the lid switch alone. logind's IdleAction is left
+off, because logind has no way to observe activity here: for a session
+of type tty it infers idleness from the atime of the session's TTY,
+and X started by startx on tty1 takes its input from evdev and never
+touches /dev/tty1. The atime freezes at login, so the session reads as
+idle from that second onward and the machine sleeps on a fixed
+interval regardless of what is being typed. An idle timeout has to be
+measured inside X, by a user-session timer or a locker, not by logind.
+
+PipeWire serves as the default audio backend, globally enabled for
+seamless login, with bare-metal hardware gates unmuted directly at the
+physical layer via ALSA. The analog card is resolved by capability
+rather than by index, since probe order is not stable.
+
+A display manager is explicitly omitted to prevent background daemon
+overhead. X11 sessions are initialized manually from the TTY. The
+network stack is systemd-networkd on the desktop and NetworkManager on
+the laptop, which needs to roam between wireless networks; both are
+heavily restricted by UFW.
+
+--- Script Execution Flow ----------------------------------------------
+
+The deployment is split into two distinct phases to maintain a minimal
+core system.
+
+install.sh (Phase 1 - Live ISO)
+  Requires a mandatory hardware profile argument (amd or intel).
+  Wipes the target disk, constructs the Btrfs on LUKS2 topology,
+  bootstraps the base packages, and generates the UKIs. It transfers
+  the Phase 2 scripts to the new filesystem before reboot.
+
+post_install.sh (Phase 2 - Booted System)
+  Enforces UFW rules, creates and signs Secure Boot keys, configures
+  zram, and establishes Snapper policies. TPM 2.0 auto-unlock
+  enrollment is deferred to a one-shot service that fires on the first
+  boot with Secure Boot active (see the boot flow above). It utilizes
+  interactive prompts to seamlessly compile custom PKGBUILDs without
+  root privileges and delegate dotfiles deployment.
+
+--- Testing ------------------------------------------------------------
+
+Three layers, none of which need root on the host, described in full
+in HACKING: a static lint (shellcheck plus a check that every package
+name the scripts use still exists), a set of post-condition assertions
+that can be run against an installed tree or a running machine, and a
+VM harness that installs both profiles unattended and asserts on the
+result.
+
+  ./tests/lint.sh --strict
+  ./tests/vm.sh --profile amd
+  sudo ./tests/assertions.sh / amd
+
+The VM harness runs both deployment phases: it installs from the ISO
+onto a blank virtual disk, then boots that disk and runs the
+post-installation on it, asserting after each. Nothing in it needs
+root on the host.
+
+post_install.sh delegates its last two steps to two other
+repositories: dotfiles, which stows the config files, and pkgbuilds,
+which compiles the custom packages. Clone both into tmp/ and the
+harness installs from those working copies instead of from their
+remotes, so a test run covers the whole deployment -- stow included,
+and a real makepkg build included -- against the trees on this
+machine. Without them the guest clones as it would on real hardware.
+See HACKING for the details.
+
+--- License ------------------------------------------------------------
+
+Copyright (C) 2026 Thiago C. Silva. Distributed under the GPLv3 license
+or later. See the LICENSE file for details.

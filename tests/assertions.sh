@@ -515,6 +515,11 @@ suite_post()
       test -f "${root}/etc/systemd/system/btrfs-scrub.service.d/ac-only.conf"
   fi
 
+  printf '\n%b== Browser ==%b\n' "$(tput bold)" "$(tput sgr0)"
+  installed "$root" 'xdg-desktop-portal-gtk'
+  has 'portal backend is gtk' \
+      "${root}/etc/xdg/xdg-desktop-portal/portals.conf" '^default=gtk$'
+
   SOFT=''
 }
 

@@ -806,7 +806,16 @@ fc-cache --force >/dev/null 2>&1 || true
 
 info -s 'Web Browser (Firefox)'
 
-pacman --sync --noconfirm firefox-developer-edition
+# The dotfiles force Firefox's file dialogs through the portal; without a
+# backend, Open and Save show nothing.
+pacman --sync --noconfirm firefox-developer-edition xdg-desktop-portal-gtk
+
+# dwm sets no XDG_CURRENT_DESKTOP, so name the backend explicitly.
+mkdir --parents /etc/xdg/xdg-desktop-portal
+cat <<'EOF' > /etc/xdg/xdg-desktop-portal/portals.conf
+[preferred]
+default=gtk
+EOF
 
 info -- 'Configuring hardware acceleration via environment variables...'
 

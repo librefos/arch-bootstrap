@@ -719,53 +719,13 @@ pacman --sync --noconfirm pipewire-pulse pipewire-alsa pipewire-jack \
                           wireplumber polkit rtkit
 
 #------------------------------------------- Audio Stack & Hardware Mapping ---
-#--- Fonts & Rendering --------------------------------------------------------
+#--- Fonts --------------------------------------------------------------------
 
-info -s 'Fonts & Rendering'
+info -s 'Fonts'
 
-# Terminus (bitmap) already covers st/dwm/dmenu via their PKGBUILD deps. This
-# stack handles GUI, web, and emoji rendering for Firefox and any Xft app:
-#   fontconfig        owns /etc/fonts and provides fc-cache; the font packages
-#                     do not depend on it, so it must be requested explicitly
-#   noto-fonts        broad Unicode sans/serif coverage
-#   noto-fonts-emoji  color emoji fallback
-#   ttf-liberation    metric-compatible Arial/Times/Courier substitutes
-pacman --sync --noconfirm fontconfig noto-fonts noto-fonts-emoji ttf-liberation
+pacman --sync --noconfirm noto-fonts ttf-liberation
 
-# System-wide fontconfig defaults. Firefox and GTK resolve their default
-# families through fontconfig, so defining them here configures the browser
-# without per-app tweaks, and appends color emoji to every fallback chain.
-cat <<'EOF' > /etc/fonts/local.conf
-<?xml version="1.0"?>
-<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
-<fontconfig>
-  <alias>
-    <family>sans-serif</family>
-    <prefer>
-      <family>Noto Sans</family>
-      <family>Noto Color Emoji</family>
-    </prefer>
-  </alias>
-  <alias>
-    <family>serif</family>
-    <prefer>
-      <family>Noto Serif</family>
-      <family>Noto Color Emoji</family>
-    </prefer>
-  </alias>
-  <alias>
-    <family>monospace</family>
-    <prefer>
-      <family>Liberation Mono</family>
-      <family>Noto Color Emoji</family>
-    </prefer>
-  </alias>
-</fontconfig>
-EOF
-
-fc-cache --force >/dev/null 2>&1 || true
-
-#-------------------------------------------------------- Fonts & Rendering ---
+#-------------------------------------------------------------------- Fonts ---
 #--- Web Browser (Firefox) ----------------------------------------------------
 
 info -s 'Web Browser (Firefox)'

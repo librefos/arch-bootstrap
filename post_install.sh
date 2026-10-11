@@ -711,48 +711,12 @@ EOF
 fi
 
 #-------------------------------------------------- Laptop Power Management ---
-#--- Audio Stack & Hardware Mapping -------------------------------------------
+#--- Audio Stack --------------------------------------------------------------
 
-info -s 'Audio Stack & Hardware Mapping'
+info -s 'Audio Stack'
 
-pacman --sync --noconfirm pipewire pipewire-audio pipewire-pulse pipewire-alsa \
-                          wireplumber polkit rtkit alsa-ucm-conf pipewire-jack \
-                          alsa-utils
-
-if [[ "$PROFILE" == 'amd' ]]; then
-  # Card indices depend on probe order. This machine happens to put the ALC897
-  # analog codec at index 1 and HDMI at 0 today, but hardcoding that means a
-  # reordered probe silently unmutes the wrong device, and the per-control
-  # `|| true` guards ensured nobody would ever notice. Resolve the card by
-  # asking which one actually exposes a Master control instead.
-  ANALOG_CARD=''
-  for _card in /proc/asound/card[0-9]*; do
-    _idx="${_card##*card}"
-    if amixer --card "$_idx" sget Master &> /dev/null; then
-      ANALOG_CARD="$_idx"
-      break
-    fi
-  done
-  readonly ANALOG_CARD
-
-  if [[ -z "$ANALOG_CARD" ]]; then
-    # Deliberately loud: this is the failure the old hardcoded index hid.
-    info -w 'No ALSA card exposes a Master control. Audio left untouched.'
-  else
-    info -- "Unmuting ALSA analog output on card ${ANALOG_CARD}..."
-
-    # These stay guarded: not every codec exposes every control.
-    amixer --card "$ANALOG_CARD" sset Master unmute 100%    >/dev/null 2>&1 || true
-    amixer --card "$ANALOG_CARD" sset Headphone unmute 100% >/dev/null 2>&1 || true
-    amixer --card "$ANALOG_CARD" sset Speaker unmute 100%   >/dev/null 2>&1 || true
-    amixer --card "$ANALOG_CARD" sset PCM unmute 100%       >/dev/null 2>&1 || true
-
-    info -- 'Saving ALSA hardware state across reboots...'
-    alsactl store
-  fi
-else
-  info -- 'Skipping manual ALSA manipulation for laptop profile.'
-fi
+pacman --sync --noconfirm pipewire-pulse pipewire-alsa pipewire-jack \
+                          wireplumber polkit rtkit
 
 #------------------------------------------- Audio Stack & Hardware Mapping ---
 #--- Fonts & Rendering --------------------------------------------------------
